@@ -28,11 +28,113 @@ http://www.cisst.org/cisst/license.txt.
 #include <cstdlib>
 #include <cstring>
 
+
 extern "C" {
 #include <psmoveapi/psmove.h>
 #include <psmoveapi/psmove_tracker.h>
 #include <psmoveapi/psmove_fusion.h>
 }
+
+
+// Utilities for OneEuroFilter
+typedef double TimeStamp; // in seconds
+static const TimeStamp UndefinedTime = -1.0;
+
+class LowPassFilter
+{
+    double y, a, s;
+    bool initialized;
+
+    void setAlpha(double alpha) {
+        if (alpha <= 0.0 || alpha > 1.0) {
+            a = 0.5; // fallback
+        } else {
+            a = alpha;
+        }
+    }
+
+public:
+    LowPassFilter(double alpha, double initval=0.0)
+        : y(initval), s(initval), initialized(false) {
+        setAlpha(alpha);
+    }
+
+    double filter(double value) {
+        double result;
+        if (initialized) {
+            result = a * value + (1.0 - a) * s;
+        } else {
+            result = value;
+            initialized = true;
+        }
+        y = value;
+        s = result;
+        return result;
+    }
+
+    double filterWithAlpha(double value, double alpha) {
+        setAlpha(alpha);
+        return filter(value);
+    }
+
+    bool hasLastRawValue() const { return initialized; }
+    double lastRawValue()   const { return y; }
+    double lastFilteredValue() const { return s; }
+};
+
+class OneEuroFilter
+{
+    double freq;
+    double mincutoff;
+    double beta_;
+    double dcutoff;
+    LowPassFilter *x;
+    LowPassFilter *dx;
+    TimeStamp lasttime;
+
+    double alpha(double cutoff) const {
+        double te = 1.0 / freq;
+        double tau = 1.0 / (2 * M_PI * cutoff);
+        return 1.0 / (1.0 + tau / te);
+    }
+
+public:
+    OneEuroFilter(double freq,
+                  double mincutoff=1.0,
+                  double beta_=0.0,
+                  double dcutoff=1.0)
+        : x(nullptr), dx(nullptr), lasttime(UndefinedTime) {
+        setFrequency(freq);
+        setMinCutoff(mincutoff);
+        setBeta(beta_);
+        setDerivateCutoff(dcutoff);
+        x  = new LowPassFilter(alpha(mincutoff));
+        dx = new LowPassFilter(alpha(dcutoff));
+    }
+
+    ~OneEuroFilter() {
+        delete x;
+        delete dx;
+    }
+
+    double filter(double value, TimeStamp timestamp=UndefinedTime) {
+        if (lasttime != UndefinedTime && timestamp != UndefinedTime && timestamp > lasttime) {
+            freq = 1.0 / (timestamp - lasttime);
+        }
+        lasttime = timestamp;
+
+        double dvalue = x->hasLastRawValue() ? (value - x->lastFilteredValue()) * freq : 0.0;
+        double edvalue = dx->filterWithAlpha(dvalue, alpha(dcutoff));
+        double cutoff = mincutoff + beta_ * fabs(edvalue);
+        return x->filterWithAlpha(value, alpha(cutoff));
+    }
+
+    void setFrequency(double f)      { freq = (f > 0 ? f : 120.0); }
+    void setMinCutoff(double mc)     { mincutoff = (mc > 0 ? mc : 1.0); }
+    void setBeta(double b)           { beta_ = b; }
+    void setDerivateCutoff(double dc){ dcutoff = (dc > 0 ? dc : 1.0); }
+};
+
 
 
 CMN_IMPLEMENT_SERVICES_DERIVED_ONEARG(mtsPSMove,
@@ -330,6 +432,15 @@ public:
     mtsFunctionWrite m_cross_event;
     bool m_move_value = false;
     mtsFunctionWrite m_move_event;
+
+    // One Euro filters per axis (meters)
+    OneEuroFilter m_filter_x{120.0, 1.2, 0.02, 1.0};
+    OneEuroFilter m_filter_y{120.0, 1.2, 0.02, 1.0};
+    OneEuroFilter m_filter_z{120.0, 1.2, 0.02, 1.0};
+    bool          m_filters_enabled = true;
+
+    // tiny deadband to kill sub-mm shimmer at rest
+    double        m_deadband_m = 0.0009; // 0.9 mm
 };
 
 
@@ -607,7 +718,28 @@ void mtsPSMove::update_data(void)
             const double X = 0.01 * static_cast<double>(x_cm); // cm -> m
             const double Y = 0.01 * static_cast<double>(y_cm); // cm -> m
             const double Z = 0.01 * static_cast<double>(z_cm); // cm -> m
-            controller->m_measured_cp.Position().Translation().Assign(X, Y, Z);
+
+            // NEW: filter with timestamp
+            const double t = osaGetTime(); // seconds
+
+            auto &T = controller->m_measured_cp.Position().Translation();
+            double Xout = X, Yout = Y, Zout = Z;
+
+            if (controller->m_filters_enabled) {
+                // apply tiny deadband around last published value to eliminate shimmer
+                const double db = controller->m_deadband_m;
+
+                if (std::fabs(X - T.X()) < db) { Xout = T.X(); }
+                else { Xout = controller->m_filter_x.filter(X, t); }
+
+                if (std::fabs(Y - T.Y()) < db) { Yout = T.Y(); }
+                else { Yout = controller->m_filter_y.filter(Y, t); }
+
+                if (std::fabs(Z - T.Z()) < db) { Zout = T.Z(); }
+                else { Zout = controller->m_filter_z.filter(Z, t); }
+            }
+
+            controller->m_measured_cp.Position().Translation().Assign(Xout, Yout, Zout);
         }
         // If not ok, we keep last translation to avoid output flicker on intermittent tracking.
     }
